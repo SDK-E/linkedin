@@ -4,10 +4,19 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { landingPage, policyPage } from "./landing.js";
 import { publishImage, publishText, type LinkedInSession } from "./linkedin.js";
+import {
+  cancelScheduledPost,
+  getScheduledPost,
+  listScheduledPosts,
+  saveScheduledPost,
+  scheduleDelivery,
+} from "./scheduler.js";
 import { get, put, remove } from "./store.js";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false }));
@@ -17,7 +26,6 @@ const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
 const redirectUri = process.env.LINKEDIN_REDIRECT_URI ?? "http://localhost:3000/oauth/linkedin/callback";
 const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? new URL(redirectUri).origin;
 const port = Number(process.env.PORT ?? 3000);
-
 const MCP_SCOPES = ["linkedin", "offline_access"];
 
 type DirectOAuthState = { kind: "direct"; userKey: string; createdAt: number };
@@ -32,14 +40,7 @@ type McpOAuthState = {
   createdAt: number;
 };
 type OAuthState = DirectOAuthState | McpOAuthState;
-
-type OAuthClient = {
-  clientId: string;
-  redirectUris: string[];
-  clientName?: string;
-  createdAt: number;
-};
-
+type OAuthClient = { clientId: string; redirectUris: string[]; clientName?: string; createdAt: number };
 type AuthorizationCode = {
   clientId: string;
   redirectUri: string;
@@ -49,7 +50,6 @@ type AuthorizationCode = {
   scope: string;
   createdAt: number;
 };
-
 type AccessGrant = { userKey: string; clientId: string; scope: string; createdAt: number };
 type RefreshGrant = { userKey: string; clientId: string; scope: string; createdAt: number };
 
@@ -66,6 +66,10 @@ function randomToken(bytes = 32) {
 
 function sha256Base64Url(value: string) {
   return crypto.createHash("sha256").update(value).digest("base64url");
+}
+
+function linkedInPostUrl(postId: string | null | undefined) {
+  return postId ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postId)}/` : null;
 }
 
 function linkedInAuthorizationUrl(state: string) {
@@ -96,7 +100,24 @@ async function bearerGrant(req: express.Request) {
   return get<AccessGrant>(accessTokenKey(match[1]));
 }
 
-app.get("/", (_req, res) => res.json({ name: "SDK LinkedIn", mcp: "/mcp", mode: "oauth-multi-user" }));
+app.get("/", (_req, res) => res.type("html").send(landingPage()));
+app.get("/health", (_req, res) => res.json({ ok: true, name: "LinkedIn Pilot", mcp: "/mcp" }));
+app.get("/privacy", (_req, res) =>
+  res.type("html").send(
+    policyPage(
+      "Privacy",
+      "LinkedIn Pilot stores the minimum data required to operate the service: encrypted LinkedIn OAuth credentials, MCP authorization grants, and scheduled-post metadata. Data is isolated per authenticated LinkedIn member. We do not sell personal data. Users may disconnect the app and request deletion of service data.\n\nContact: hello@sdk.enterprises",
+    ),
+  ),
+);
+app.get("/terms", (_req, res) =>
+  res.type("html").send(
+    policyPage(
+      "Terms of Use",
+      "LinkedIn Pilot lets users publish and schedule content to a LinkedIn account they control. Users remain responsible for published content and compliance with LinkedIn terms, applicable law and OpenAI policies. The service may not be used for spam, deceptive activity or unauthorized account access. Availability depends on third-party APIs and platform policies.\n\nContact: hello@sdk.enterprises",
+    ),
+  ),
+);
 
 const protectedResourceMetadata = (_req: express.Request, res: express.Response) =>
   res.json({
@@ -138,7 +159,6 @@ app.post("/oauth/register", async (req, res) => {
     createdAt: Date.now(),
   };
   await put(oauthClientKey(id), record);
-
   return res.status(201).json({
     client_id: id,
     client_id_issued_at: Math.floor(record.createdAt / 1000),
@@ -196,8 +216,8 @@ app.post("/oauth/token", async (req, res) => {
     const codeVerifier = String(req.body?.code_verifier ?? "");
     const grant = await get<AuthorizationCode>(authCodeKey(code));
     if (!grant) return oauthError(res, 400, "invalid_grant");
-
     await remove(authCodeKey(code));
+
     if (grant.clientId !== requestedClientId || grant.redirectUri !== requestedRedirectUri) {
       return oauthError(res, 400, "invalid_grant");
     }
@@ -207,15 +227,17 @@ app.post("/oauth/token", async (req, res) => {
 
     const accessToken = randomToken(32);
     const refreshToken = randomToken(40);
-    await put(accessTokenKey(accessToken), { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies AccessGrant, 3600);
-    await put(refreshTokenKey(refreshToken), { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies RefreshGrant, 60 * 60 * 24 * 90);
-    return res.json({
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: 3600,
-      refresh_token: refreshToken,
-      scope: grant.scope,
-    });
+    await put(
+      accessTokenKey(accessToken),
+      { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies AccessGrant,
+      3600,
+    );
+    await put(
+      refreshTokenKey(refreshToken),
+      { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies RefreshGrant,
+      60 * 60 * 24 * 90,
+    );
+    return res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600, refresh_token: refreshToken, scope: grant.scope });
   }
 
   if (grantType === "refresh_token") {
@@ -225,7 +247,11 @@ app.post("/oauth/token", async (req, res) => {
     if (!grant || grant.clientId !== requestedClientId) return oauthError(res, 400, "invalid_grant");
 
     const accessToken = randomToken(32);
-    await put(accessTokenKey(accessToken), { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies AccessGrant, 3600);
+    await put(
+      accessTokenKey(accessToken),
+      { userKey: grant.userKey, clientId: grant.clientId, scope: grant.scope, createdAt: Date.now() } satisfies AccessGrant,
+      3600,
+    );
     return res.json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600, scope: grant.scope });
   }
 
@@ -268,7 +294,6 @@ app.get("/oauth/linkedin/callback", async (req, res) => {
     if (!userInfoResponse.ok) return res.status(502).send(await userInfoResponse.text());
     const user = (await userInfoResponse.json()) as { sub: string; name?: string };
     const userKey = `linkedin:${user.sub}`;
-
     const session: LinkedInSession = {
       accessToken: token.access_token,
       personUrn: `urn:li:person:${user.sub}`,
@@ -305,8 +330,34 @@ app.get("/oauth/linkedin/callback", async (req, res) => {
   }
 });
 
+app.post("/internal/scheduled/:id", async (req, res) => {
+  const secret = process.env.SCHEDULER_DISPATCH_SECRET;
+  if (!secret || req.header("authorization") !== `Bearer ${secret}`) return res.status(401).json({ error: "unauthorized" });
+
+  const post = await getScheduledPost(req.params.id);
+  if (!post) return res.status(404).json({ error: "not_found" });
+  if (post.status !== "scheduled") return res.json({ ok: true, status: post.status });
+
+  try {
+    const session = await get<LinkedInSession>(sessionKey(post.userKey));
+    if (!session) throw new Error("LinkedIn session is unavailable or expired");
+    const postId = post.imageUrl
+      ? await publishImage(session, post.commentary, post.imageUrl, post.altText)
+      : await publishText(session, post.commentary);
+    post.status = "published";
+    post.postId = postId;
+    await saveScheduledPost(post);
+    return res.json({ ok: true, postId, postUrl: linkedInPostUrl(postId) });
+  } catch (error) {
+    post.status = "failed";
+    post.error = error instanceof Error ? error.message : "Scheduled publication failed";
+    await saveScheduledPost(post);
+    return res.status(500).json({ error: "publish_failed", message: post.error });
+  }
+});
+
 function createMcpServer(userKey: string) {
-  const server = new McpServer({ name: "sdk-linkedin", version: "0.4.0" });
+  const server = new McpServer({ name: "sdk-linkedin", version: "0.5.0" });
 
   server.registerTool(
     "linkedin_auth_status",
@@ -329,7 +380,7 @@ function createMcpServer(userKey: string) {
     "linkedin_publish_post",
     {
       title: "Publish LinkedIn post",
-      description: "Publish a text post to the authenticated user's LinkedIn profile.",
+      description: "Publish a text post now to the authenticated user's LinkedIn profile.",
       inputSchema: { commentary: z.string().min(1).max(3000) },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
@@ -337,9 +388,10 @@ function createMcpServer(userKey: string) {
       const session = await get<LinkedInSession>(sessionKey(userKey));
       if (!session) throw new Error("LinkedIn connection is unavailable or expired. Reconnect the app.");
       const postId = await publishText(session, commentary);
+      const postUrl = linkedInPostUrl(postId);
       return {
-        content: [{ type: "text", text: `Published LinkedIn post${postId ? `: ${postId}` : "."}` }],
-        structuredContent: { postId },
+        content: [{ type: "text", text: postUrl ? `Published: ${postUrl}` : "Published LinkedIn post." }],
+        structuredContent: { postId, postUrl },
       };
     },
   );
@@ -348,21 +400,98 @@ function createMcpServer(userKey: string) {
     "linkedin_publish_image_post",
     {
       title: "Publish LinkedIn image post",
-      description: "Publish a post with an image to the authenticated user's LinkedIn profile.",
-      inputSchema: {
-        commentary: z.string().min(1).max(3000),
-        imageUrl: z.string().url(),
-        altText: z.string().max(1000).optional(),
-      },
+      description: "Publish a post with an image now to the authenticated user's LinkedIn profile.",
+      inputSchema: { commentary: z.string().min(1).max(3000), imageUrl: z.string().url(), altText: z.string().max(1000).optional() },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
     async ({ commentary, imageUrl, altText }) => {
       const session = await get<LinkedInSession>(sessionKey(userKey));
       if (!session) throw new Error("LinkedIn connection is unavailable or expired. Reconnect the app.");
       const postId = await publishImage(session, commentary, imageUrl, altText);
+      const postUrl = linkedInPostUrl(postId);
       return {
-        content: [{ type: "text", text: `Published LinkedIn image post${postId ? `: ${postId}` : "."}` }],
-        structuredContent: { postId },
+        content: [{ type: "text", text: postUrl ? `Published: ${postUrl}` : "Published LinkedIn image post." }],
+        structuredContent: { postId, postUrl },
+      };
+    },
+  );
+
+  server.registerTool(
+    "linkedin_schedule_post",
+    {
+      title: "Schedule LinkedIn post",
+      description: "Schedule a text post for a specific future ISO-8601 date/time.",
+      inputSchema: { commentary: z.string().min(1).max(3000), publishAt: z.string().datetime({ offset: true }) },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ commentary, publishAt }) => {
+      const post = await scheduleDelivery({ userKey, commentary, publishAt });
+      return {
+        content: [{ type: "text", text: `Scheduled for ${post.publishAt}. Schedule ID: ${post.id}` }],
+        structuredContent: { id: post.id, publishAt: post.publishAt, status: post.status },
+      };
+    },
+  );
+
+  server.registerTool(
+    "linkedin_schedule_image_post",
+    {
+      title: "Schedule LinkedIn image post",
+      description: "Schedule an image post for a specific future ISO-8601 date/time.",
+      inputSchema: {
+        commentary: z.string().min(1).max(3000),
+        imageUrl: z.string().url(),
+        altText: z.string().max(1000).optional(),
+        publishAt: z.string().datetime({ offset: true }),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ commentary, imageUrl, altText, publishAt }) => {
+      const post = await scheduleDelivery({ userKey, commentary, imageUrl, altText, publishAt });
+      return {
+        content: [{ type: "text", text: `Scheduled image post for ${post.publishAt}. Schedule ID: ${post.id}` }],
+        structuredContent: { id: post.id, publishAt: post.publishAt, status: post.status },
+      };
+    },
+  );
+
+  server.registerTool(
+    "linkedin_list_scheduled_posts",
+    {
+      title: "List scheduled LinkedIn posts",
+      description: "List the authenticated user's recent scheduled posts and their status.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async () => {
+      const posts = await listScheduledPosts(userKey);
+      const summary = posts.map(({ id, publishAt, status, postId, commentary }) => ({
+        id,
+        publishAt,
+        status,
+        postUrl: linkedInPostUrl(postId),
+        preview: commentary.slice(0, 120),
+      }));
+      return {
+        content: [{ type: "text", text: summary.length ? JSON.stringify(summary, null, 2) : "No scheduled posts." }],
+        structuredContent: { posts: summary },
+      };
+    },
+  );
+
+  server.registerTool(
+    "linkedin_cancel_scheduled_post",
+    {
+      title: "Cancel scheduled LinkedIn post",
+      description: "Cancel one scheduled LinkedIn post before it is published.",
+      inputSchema: { id: z.string().uuid() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ id }) => {
+      const post = await cancelScheduledPost(userKey, id);
+      return {
+        content: [{ type: "text", text: `Cancelled scheduled post ${post.id}.` }],
+        structuredContent: { id: post.id, status: post.status },
       };
     },
   );
@@ -373,10 +502,7 @@ function createMcpServer(userKey: string) {
 app.all("/mcp", async (req, res) => {
   const grant = await bearerGrant(req);
   if (!grant) {
-    res.setHeader(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${publicBaseUrl}/.well-known/oauth-protected-resource/mcp"`,
-    );
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${publicBaseUrl}/.well-known/oauth-protected-resource/mcp"`);
     return res.status(401).json({ error: "unauthorized" });
   }
 
@@ -387,6 +513,6 @@ app.all("/mcp", async (req, res) => {
   res.on("close", () => void transport.close());
 });
 
-if (!process.env.VERCEL) app.listen(port, () => console.log(`SDK LinkedIn MCP listening on :${port}`));
+if (!process.env.VERCEL) app.listen(port, () => console.log(`LinkedIn Pilot MCP listening on :${port}`));
 
 export default app;
