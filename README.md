@@ -1,23 +1,40 @@
-# SDK-E LinkedIn ChatGPT App
+# LinkedIn Pilot
 
-ChatGPT App / MCP server for Hicham SADDEK's personal LinkedIn account.
+ChatGPT App / MCP server by SDK Enterprises for publishing to personal LinkedIn accounts.
 
-## Tools
+## MCP tools
 
 - `linkedin_auth_status`
 - `linkedin_publish_post`
 - `linkedin_publish_image_post`
+- `linkedin_schedule_post`
+- `linkedin_schedule_image_post`
+- `linkedin_list_scheduled_posts`
+- `linkedin_cancel_scheduled_post`
+
+Publish tools return the LinkedIn post ID and a usable post URL.
 
 ## LinkedIn access
 
-The app uses LinkedIn OAuth with:
+The app uses LinkedIn OAuth with `openid`, `profile`, `email`, and `w_member_social`. Never commit the LinkedIn client secret or user tokens.
 
-- `openid`
-- `profile`
-- `email`
-- `w_member_social`
+## Scheduling
 
-Client ID is already configured in `.env.example`. Never commit the client secret.
+Scheduled posts are stored in the encrypted service store and dispatched through QStash at the requested time. Required production variables:
+
+- `PUBLIC_BASE_URL=https://linkedin.sdk.enterprises`
+- `QSTASH_TOKEN`
+- `SCHEDULER_DISPATCH_SECRET`
+
+The QStash free tier supports delays up to 7 days; longer delays require a paid QStash plan.
+
+## Public routes
+
+- `/` — product landing page
+- `/privacy` — privacy page
+- `/terms` — terms page
+- `/health` — health check
+- `/mcp` — authenticated MCP endpoint
 
 ## Local run
 
@@ -27,11 +44,6 @@ cp .env.example .env
 pnpm dev
 ```
 
-MCP endpoint: `http://localhost:3000/mcp`
-LinkedIn connect: `http://localhost:3000/oauth/linkedin/start`
+## Architecture
 
-## Goal
-
-Allow ChatGPT to publish the final version of a post directly to Hicham's LinkedIn profile, including image/meme posts, while keeping the publishing API separate from the content-generation workflow.
-
-Next stages: durable OAuth/session handling, document/multi-image posts, post-history/edit-learning storage, scheduling integration, and production deployment.
+ChatGPT authenticates to this MCP server through OAuth 2.1 + PKCE. The server delegates account authorization to LinkedIn and isolates sessions by the authenticated LinkedIn member. Scheduled delivery uses a private authenticated callback and idempotent schedule records.
