@@ -98,7 +98,6 @@ async function bearerGrant(req: express.Request) {
 
 app.get("/", (_req, res) => res.json({ name: "SDK LinkedIn", mcp: "/mcp", mode: "oauth-multi-user" }));
 
-// RFC 9728 protected-resource metadata. Serve both forms used by MCP clients.
 const protectedResourceMetadata = (_req: express.Request, res: express.Response) =>
   res.json({
     resource: `${publicBaseUrl}/mcp`,
@@ -109,7 +108,6 @@ const protectedResourceMetadata = (_req: express.Request, res: express.Response)
 app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
 app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
-// OAuth 2.1 authorization-server discovery for ChatGPT/MCP clients.
 app.get("/.well-known/oauth-authorization-server", (_req, res) =>
   res.json({
     issuer: publicBaseUrl,
@@ -124,13 +122,11 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) =>
   }),
 );
 
-// Backward-compatible Dynamic Client Registration. MCP 2026-07 deprecates DCR in
-// favor of client-id metadata documents, but current clients may still use it.
 app.post("/oauth/register", async (req, res) => {
-  const redirectUris = Array.isArray(req.body?.redirect_uris)
+  const redirectUris: string[] = Array.isArray(req.body?.redirect_uris)
     ? req.body.redirect_uris.filter((value: unknown): value is string => typeof value === "string")
     : [];
-  if (!redirectUris.length || redirectUris.some((uri) => !/^https:\/\//i.test(uri))) {
+  if (!redirectUris.length || redirectUris.some((uri: string) => !/^https:\/\//i.test(uri))) {
     return oauthError(res, 400, "invalid_redirect_uri", "At least one HTTPS redirect_uri is required.");
   }
 
@@ -236,7 +232,6 @@ app.post("/oauth/token", async (req, res) => {
   return oauthError(res, 400, "unsupported_grant_type");
 });
 
-// Optional direct connect route for browser/manual testing.
 app.get("/oauth/linkedin/start", async (req, res) => {
   const userKey = typeof req.query.user === "string" ? req.query.user : "manual";
   return res.redirect(await directAuthUrl(userKey));
